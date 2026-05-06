@@ -157,20 +157,49 @@ export default function Index() {
   const canProcess = photos.length > 0;
   const processingCount = photos.filter((p) => p.status === "processing").length;
 
-  const handleProcess = () => {
+  const processPhoto = async (photo: PhotoFile, prompt: string, strength: number) => {
+    const toBase64 = (file: File): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+
+    const imageB64 = await toBase64(photo.file);
+
+    const resp = await fetch(
+      "https://functions.poehali.dev/4be1eaf0-3470-4a72-8fc8-0a8b58609958",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image: imageB64, prompt, strength }),
+      }
+    );
+
+    const data = await resp.json();
+    if (!resp.ok || data.error) throw new Error(data.error || "Ошибка обработки");
+    return data.result as string;
+  };
+
+  const handleProcess = async () => {
     const idlePhotos = photos.filter((p) => p.status === "idle");
     setPhotos((prev) =>
       prev.map((p) => (p.status === "idle" ? { ...p, status: "processing" } : p))
     );
-    idlePhotos.forEach((photo, i) => {
-      setTimeout(() => {
+
+    for (const photo of idlePhotos) {
+      try {
+        const result = await processPhoto(photo, fullPrompt, strength[0]);
         setPhotos((prev) =>
-          prev.map((p) =>
-            p.id === photo.id ? { ...p, status: "done", result: p.preview } : p
-          )
+          prev.map((p) => (p.id === photo.id ? { ...p, status: "done", result } : p))
         );
-      }, 2000 + i * 800);
-    });
+      } catch {
+        setPhotos((prev) =>
+          prev.map((p) => (p.id === photo.id ? { ...p, status: "error" } : p))
+        );
+      }
+    }
   };
 
   return (
@@ -269,6 +298,13 @@ export default function Index() {
                       <div className="absolute inset-0 flex flex-col items-center justify-center bg-background/80 backdrop-blur-sm">
                         <div className="w-8 h-8 rounded-full border-2 border-primary border-t-transparent animate-spin mb-2" />
                         <span className="text-xs text-muted-foreground">Обработка...</span>
+                      </div>
+                    )}
+
+                    {photo.status === "error" && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-background/80 backdrop-blur-sm">
+                        <Icon name="AlertCircle" size={22} className="text-destructive mb-1" />
+                        <span className="text-xs text-destructive">Ошибка</span>
                       </div>
                     )}
 
