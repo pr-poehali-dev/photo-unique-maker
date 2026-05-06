@@ -66,7 +66,7 @@ def randomize_exif(prompt: str) -> bytes:
         exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = dt_str.encode()
         exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = dt_str.encode()
 
-        exif_dict["Exif"][piexif.ExifIFD.ISOSpeedRatings] = random.choice([100, 125, 160, 200, 250, 320, 400, 500, 640, 800])
+        exif_dict["Exif"][piexif.ExifIFD.ISOSpeedRatings] = random.choice([100, 125, 160, 200, 250, 320, 400, 500])
         exif_dict["Exif"][piexif.ExifIFD.ExposureTime] = random.choice([(1, 100), (1, 200), (1, 250), (1, 500), (1, 1000)])
         exif_dict["Exif"][piexif.ExifIFD.FNumber] = random.choice([(14, 5), (18, 5), (20, 5), (28, 5), (40, 5)])
         exif_dict["Exif"][piexif.ExifIFD.FocalLength] = random.choice([(35, 1), (50, 1), (85, 1), (100, 1), (135, 1)])
@@ -79,8 +79,51 @@ def randomize_exif(prompt: str) -> bytes:
         return b""
 
 
+def fal_run(endpoint: str, payload: dict, fal_key: str) -> dict:
+    """Отправляет задачу в fal.ai queue и ждёт результата."""
+    headers = {
+        "Authorization": f"Key {fal_key}",
+        "Content-Type": "application/json",
+    }
+
+    # Submit
+    submit_resp = requests.post(
+        f"https://queue.fal.run/{endpoint}",
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+    print(f"Submit status: {submit_resp.status_code}, body: {submit_resp.text[:300]}")
+    submit_resp.raise_for_status()
+    request_id = submit_resp.json()["request_id"]
+
+    # Poll until done
+    for _ in range(60):
+        time.sleep(3)
+        status_resp = requests.get(
+            f"https://queue.fal.run/{endpoint}/requests/{request_id}/status",
+            headers=headers,
+            timeout=10,
+        )
+        status_data = status_resp.json()
+        status = status_data.get("status")
+        print(f"Poll status: {status}")
+
+        if status == "COMPLETED":
+            result_resp = requests.get(
+                f"https://queue.fal.run/{endpoint}/requests/{request_id}",
+                headers=headers,
+                timeout=30,
+            )
+            return result_resp.json()
+        elif status in ("FAILED", "CANCELLED"):
+            raise Exception(f"fal.ai job failed: {status_data}")
+
+    raise Exception("fal.ai timeout after 180s")
+
+
 def handler(event: dict, context) -> dict:
-    """Принимает base64 фото, загружает в S3, отправляет в fal.ai, возвращает обработанное фото с новыми EXIF."""
+    """Принимает base64 фото, загружает в S3, отправляет в fal.ai queue, возвращает обработанное фото с новыми EXIF."""
 
     if event.get("httpMethod") == "OPTIONS":
         return {"statusCode": 200, "headers": CORS_HEADERS, "body": ""}
@@ -109,16 +152,13 @@ def handler(event: dict, context) -> dict:
     img.save(buf, format="JPEG", quality=85)
     compressed_bytes = buf.getvalue()
 
-    # Загружаем в S3 и получаем публичный URL
+    # Загружаем в S3
     filename = f"input_{int(time.time())}_{random.randint(1000, 9999)}.jpg"
     image_url = upload_to_s3(compressed_bytes, filename)
+    print(f"Uploaded to S3: {image_url}")
 
-    # Вызываем fal.ai
     fal_key = os.environ.get("FAL_API_KEY", FAL_KEY)
-    headers = {
-        "Authorization": f"Key {fal_key}",
-        "Content-Type": "application/json",
-    }
+
     payload = {
         "prompt": prompt,
         "image_url": image_url,
@@ -127,21 +167,9 @@ def handler(event: dict, context) -> dict:
         "guidance_scale": 3.5,
     }
 
-    resp = requests.post(
-        "https://fal.run/fal-ai/flux/dev/image-to-image",
-        headers=headers,
-        json=payload,
-        timeout=120,
-    )
+    result = fal_run("fal-ai/flux/dev/image-to-image", payload, fal_key)
+    print(f"fal.ai result keys: {list(result.keys())}")
 
-    if resp.status_code != 200:
-        return {
-            "statusCode": 502,
-            "headers": CORS_HEADERS,
-            "body": json.dumps({"error": f"fal.ai error {resp.status_code}: {resp.text[:300]}"}),
-        }
-
-    result = resp.json()
     result_url = result["images"][0]["url"]
 
     # Скачиваем результат
